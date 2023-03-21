@@ -1,0 +1,27 @@
+{
+  "data_folder": "./data",
+  "ffmpeg_working_folder": "./gifs",
+  "tele_bot_token": "XXX",
+  "tele_chat_id": 123,
+  "synology_base_api_url": "http://127.0.0.1",
+  "synology_user": "admin",
+  "synology_password": "password123",
+  "synology_cameras": [
+    {
+      "id": 1,
+      "skip_first_n_secs": 5,
+      "max_length_secs": 5,
+      "scale": 320,
+      "tele_bot_token": "XXX",
+      "tele_chat_id": 123
+    },
+    {
+      "id": 2,
+      "skip_first_n_secs": 7,
+      "max_length_secs": 10,
+      "scale": 640,
+      "tele_bot_token": "XXX",
+      "tele_chat_id": 123
+    }
+  ]
+}
