@@ -133,7 +133,7 @@ def syno_last_event(base_url, camera_id, camera_time, srcType, srcId, sid):
         if not event_data["success"]:
             err_code = event_data["error"]["code"]
             # handle auth failure and exit to re-authenticate
-            if (code >= 105 and code <= 107) or code == 119:
+            if (err_code >= 105 and err_code <= 107) or err_code == 119:
                 logged_in = False
             return -1, 0
 
