@@ -28,7 +28,7 @@ synoApiLoginUrl = "{}/webapi/auth.cgi?api=SYNO.API.Auth&method=login&version=6" 
                   "&session=SurveillanceStation&format=cookie&account={}&passwd={}"
 synoApiCamerasInfoUrl = "{}/webapi/entry.cgi?api=SYNO.SurveillanceStation.Camera&method=List&version=1&_sid={}"
 synoApiEventQueryUrl = "{}/webapi/entry.cgi?api=SYNO.SurveillanceStation.Recording&method=List" \
-                       "&version=5&locked=0&reason=2&limit=1&cameraIds={}&evtSrcType={}&evtSrcId={}&_sid={}"
+                       "&version=5&locked=0&limit=1&cameraIds={}&evtSrcType={}&evtSrcId={}&_sid={}"
 synoApiEventDownloadUrl = "{}/webapi/entry.cgi?api=SYNO.SurveillanceStation.Recording" \
                           "&method=Download&version=6&id={}&_sid={}"
 synoApiCMSEventDownloadUrl = "{}/webapi/entry.cgi?api=SYNO.SurveillanceStation.CMS&method=Redirect&version=1&dsId={}&webAPI={}&isDownloadFile=true&_sid={}"
