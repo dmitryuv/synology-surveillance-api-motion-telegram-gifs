@@ -28,7 +28,7 @@ synoApiLoginUrl = "{}/webapi/auth.cgi?api=SYNO.API.Auth&method=login&version=6" 
                   "&session=SurveillanceStation&format=cookie&account={}&passwd={}"
 synoApiCamerasInfoUrl = "{}/webapi/entry.cgi?api=SYNO.SurveillanceStation.Camera&method=List&version=1&_sid={}"
 synoApiEventQueryUrl = "{}/webapi/entry.cgi?api=SYNO.SurveillanceStation.Recording&method=List" \
-                       "&version=5&locked=0&limit=1&cameraIds={}&evtSrcType={}&evtSrcId={}&_sid={}"
+                       "&version=5&locked=0&dualRecModeList=0&limit=1&cameraIds={}&evtSrcType={}&evtSrcId={}&_sid={}"
 synoApiEventDownloadUrl = "{}/webapi/entry.cgi?api=SYNO.SurveillanceStation.Recording" \
                           "&method=Download&version=6&id={}&_sid={}"
 synoApiCMSEventDownloadUrl = "{}/webapi/entry.cgi?api=SYNO.SurveillanceStation.CMS&method=Redirect&version=1&dsId={}&webAPI={}&isDownloadFile=true&_sid={}"
@@ -221,7 +221,8 @@ class CameraMotionEventHandler:
             tb.send_chat_action(chat_id, 'upload_video')
 
             fb = open(gif, "rb")
-            retcode = tb.send_animation(chat_id, fb, disable_notification=True)
+
+            retcode = tb.send_animation(chat_id, fb, disable_notification=True, caption=self.camera["name"])
             fb.close()
 
             # remove file on success
@@ -308,6 +309,7 @@ def main():
                         for camera in config["synology_cameras"]:
                             if camera["id"] == camera_info["id"]:
                                 camera["dsId"] = camera_info["ownerDsId"]
+                                camera["name"] = camera_info["name"]
                                 # delete active handler during re-auth
                                 camera.pop("handler", None)
 
