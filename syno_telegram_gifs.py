@@ -11,6 +11,7 @@ import urllib.parse
 import telebot
 from pathlib import Path
 from sqlite3 import Error
+from telebot.apihelper import ApiTelegramException
 
 import requests
 # disable SSL exceptions
@@ -211,29 +212,40 @@ class CameraMotionEventHandler:
         self.processed_events_conn = processed_events_conn
 
     def publish_telegram_message(self, gif):
-        try:
-            if not "bot" in self.camera:
-                logging.error("Camera %s does not have bot configured", self.camera["id"])
+        max_attempts = 3  # maximum number of retries
+        for attempt in range(1, max_attempts + 1):
+            try:
+                if not "bot" in self.camera:
+                    logging.error("Camera %s does not have bot configured", self.camera["id"])
+                    return True
+
+                tb = self.camera["bot"]
+                chat_id = self.camera["tele_chat_id"]
+                tb.send_chat_action(chat_id, 'upload_video')
+
+                with open(gif, "rb") as fb: 
+                    retcode = tb.send_animation(chat_id, fb, disable_notification=True, caption=self.camera["name"])
+
+                # remove file on success
+                os.remove(gif)
                 return True
 
-            tb = self.camera["bot"]
-            chat_id = self.camera["tele_chat_id"]
-            tb.send_chat_action(chat_id, 'upload_video')
+            except ApiTelegramException as e:
+                if e.error_code == 429:  # "Too Many Requests"
+                    retry_after = e.result_json['parameters']['retry_after']
+                    logging.warning("Telegram rate limit hit (attempt %d/%d). Retrying in %s seconds...", 
+                                   attempt, max_attempts, retry_after)
+                    time.sleep(retry_after)
+                else:
+                    logging.error("Telegram API exception: %s", e)
+                    return False
 
-            fb = open(gif, "rb")
+            except Exception as e:
+                logging.error("General exception: %s", e)
+                return False
 
-            retcode = tb.send_animation(chat_id, fb, disable_notification=True, caption=self.camera["name"])
-            fb.close()
-
-            # remove file on success
-            os.remove(gif)
-
-            return True
-        except Error as e:
-            logging.error("Telegram exception", e)
-
-            return False
-
+        logging.error("Failed to send after %d attempts", max_attempts)
+        return False
 
 
     def poll_event(self):
