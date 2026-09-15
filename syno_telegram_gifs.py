@@ -7,9 +7,7 @@ import sqlite3
 import subprocess
 import sys
 import time
-import urllib.parse
 import telebot
-from pathlib import Path
 from sqlite3 import Error
 from telebot import apihelper
 from telebot.apihelper import ApiTelegramException
@@ -41,6 +39,12 @@ synoApiEventDownloadUrlPartial = "{}/webapi/entry.cgi?api=SYNO.SurveillanceStati
 # extra playback seconds appended after skip_first_n_secs + max_length_secs when downloading a slice
 DOWNLOAD_MARGIN_SECS = 4
 
+# sync API authentication error codes returned for an expired/invalid session
+SYNO_AUTH_ERROR_CODES = {105, 106, 107, 119}
+
+DOWNLOAD_CHUNK_SIZE = 4096
+DOWNLOAD_PROGRESS_SCALE = 50
+
 sql_create_processed_events_table = """ CREATE TABLE IF NOT EXISTS processed_events (
                                         id integer PRIMARY KEY,
                                         camera_id text NOT NULL,
@@ -60,7 +64,7 @@ def parse_config(config_path):
 def create_connection(data_folder):
     try:
         conn = sqlite3.connect(data_folder + '/processed_events.db')
-        print(sqlite3.version)
+        logging.info('SQLite version %s', sqlite3.version)
         return conn
     except Error as e:
         logging.error("CANNOT CREATE DB", e)
@@ -77,28 +81,24 @@ def create_processed_events_table(conn):
         logging.error("CANNOT CREATE TABLE", e)
 
 
-def check_already_processed_event_by_camera(conn, camera_id, event_id):
+def is_event_processed(conn, camera_id, event_id):
     cur = conn.cursor()
-    cur.execute("SELECT * FROM processed_events WHERE camera_id=? AND last_event_id >=?", (camera_id, event_id))
+    cur.execute("SELECT 1 FROM processed_events WHERE camera_id=? AND last_event_id>=? LIMIT 1",
+                (camera_id, event_id))
 
-    rows = cur.fetchall()
-
-    already_processed = False
-    for row in rows:
-        #logging.error("Event %s already processed %s", event_id, row)
-        already_processed = True
-
-    return already_processed
+    return cur.fetchone() is not None
 
 
 def replace_processed_events(conn, processed_event):
-    sql = ''' REPLACE INTO processed_events(camera_id, last_event_id ,processed_date)
-              VALUES(?,?,?) '''
+    sql = ''' INSERT INTO processed_events(camera_id, last_event_id, processed_date)
+              VALUES(?,?,?)
+              ON CONFLICT(camera_id) DO UPDATE SET
+                last_event_id=excluded.last_event_id,
+                processed_date=excluded.processed_date '''
     cur = conn.cursor()
     cur.execute(sql, processed_event)
 
     conn.commit()
-    return cur.lastrowid
 
 
 def syno_login(base_url, user, password):
@@ -108,7 +108,6 @@ def syno_login(base_url, user, password):
     if login_response.ok:
         login_data = json.loads(login_response.content.decode('utf-8'))
         if login_data["success"]:
-            #logging.info('login_response got sinotoken %s', login_data["data"]["sid"])
             return login_data["data"]["sid"]
         else:
             return ""
@@ -119,7 +118,6 @@ def syno_login(base_url, user, password):
 
 def syno_info(base_url, sid):
     info_response = requests.get(synoApiCamerasInfoUrl.format(base_url, sid), verify=False)
-    #logging.info('info_response status_code %s', info_response.status_code)
 
     if info_response.ok:
         info_data = json.loads(info_response.content.decode('utf-8'))
@@ -130,17 +128,18 @@ def syno_info(base_url, sid):
 
 
 def syno_last_event(base_url, camera_id, camera_time, srcType, srcId, sid):
+    global logged_in
+
     event_response = requests.get(synoApiEventQueryUrl.format(base_url, camera_id, srcType, srcId, sid),
                                   verify=False)
-    #logging.info('event_response status_code %s', event_response.status_code)
 
     if event_response.ok:
         event_data = json.loads(event_response.content.decode('utf-8'))
-        
+
         if not event_data["success"]:
             err_code = event_data["error"]["code"]
             # handle auth failure and exit to re-authenticate
-            if (err_code >= 105 and err_code <= 107) or err_code == 119:
+            if err_code in SYNO_AUTH_ERROR_CODES:
                 logged_in = False
             return -1, 0
 
@@ -151,28 +150,26 @@ def syno_last_event(base_url, camera_id, camera_time, srcType, srcId, sid):
         rec_time = event_rec["stopTime"] - event_rec["startTime"]
 
         if event_rec["cameraId"] == camera_id and (event_rec["recording"] == False or (event_rec["recording"] == True and rec_time >= camera_time)):
-            #logging.info('found event for camera %s', event_rec["camera_name"])
             return event_rec["id"], event_rec["dsId"]
     else:
         event_response.raise_for_status()
-    
+
     return -1, 0
 
 
 def syno_download_video(download_dir, base_url, event_id, event_ds_id, sid):
-    outfile_gif = '{}/{}.mp4'.format(download_dir, event_id)
+    outfile_mp4 = '{}/{}.mp4'.format(download_dir, event_id)
 
-    with open(outfile_gif, "wb") as f:
-        logging.info('Downloading video for event id %i to %s .....', event_id, outfile_gif)
-        
+    with open(outfile_mp4, "wb") as f:
+        logging.info('Downloading video for event id %i to %s .....', event_id, outfile_mp4)
+
         if event_ds_id > 0:
-            redirectArgs = synoApiCMSRedirectArgs.format(event_id)
-            uri = synoApiCMSEventDownloadUrl.format(base_url, event_ds_id, redirectArgs, sid)
+            redirect_args = synoApiCMSRedirectArgs.format(event_id)
+            uri = synoApiCMSEventDownloadUrl.format(base_url, event_ds_id, redirect_args, sid)
         else:
             uri = synoApiEventDownloadUrl.format(base_url, event_id, sid)
 
         download_response = requests.get(uri, verify=False, stream=True)
-        #logging.info('download_response status_code %s', download_response.status_code)
 
         if download_response.ok:
             total_length = download_response.headers.get('content-length')
@@ -182,25 +179,24 @@ def syno_download_video(download_dir, base_url, event_id, event_ds_id, sid):
             else:
                 dl = 0
                 total_length = int(total_length)
-                for data in download_response.iter_content(chunk_size=4096):
+                for data in download_response.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
                     dl += len(data)
                     f.write(data)
-                    done = int(50 * dl / total_length)
-                    #sys.stdout.write("\r[%s%s]" % ('=' * done, ' ' * (50 - done)))
+                    done = int(DOWNLOAD_PROGRESS_SCALE * dl / total_length)
                     sys.stdout.flush()
-            logging.info('Downloading video for event id %i to %s .....DONE', event_id, outfile_gif)
-            return outfile_gif
+            logging.info('Downloading video for event id %i to %s .....DONE', event_id, outfile_mp4)
+            return outfile_mp4
 
         else:
             download_response.raise_for_status()
 
 
 def syno_download_video_partial(download_dir, base_url, event_id, event_ds_id, sid, play_time_ms, offset_time_ms=0):
-    outfile_gif = '{}/{}.mp4'.format(download_dir, event_id)
+    outfile_mp4 = '{}/{}.mp4'.format(download_dir, event_id)
 
-    with open(outfile_gif, "wb") as f:
+    with open(outfile_mp4, "wb") as f:
         logging.info('Downloading partial video for event id %i (offset %ims, play %ims) to %s .....',
-                     event_id, offset_time_ms, play_time_ms, outfile_gif)
+                     event_id, offset_time_ms, play_time_ms, outfile_mp4)
 
         if event_ds_id > 0:
             redirect_args = json.dumps({
@@ -216,7 +212,6 @@ def syno_download_video_partial(download_dir, base_url, event_id, event_ds_id, s
             uri = synoApiEventDownloadUrlPartial.format(base_url, event_id, offset_time_ms, play_time_ms, sid)
 
         download_response = requests.get(uri, verify=False, stream=True)
-        #logging.info('download_response status_code %s', download_response.status_code)
 
         if download_response.ok:
             total_length = download_response.headers.get('content-length')
@@ -226,13 +221,13 @@ def syno_download_video_partial(download_dir, base_url, event_id, event_ds_id, s
             else:
                 dl = 0
                 total_length = int(total_length)
-                for data in download_response.iter_content(chunk_size=4096):
+                for data in download_response.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
                     dl += len(data)
                     f.write(data)
-                    done = int(50 * dl / total_length)
+                    done = int(DOWNLOAD_PROGRESS_SCALE * dl / total_length)
                     sys.stdout.flush()
-            logging.info('Downloading partial video for event id %i to %s .....DONE', event_id, outfile_gif)
-            return outfile_gif
+            logging.info('Downloading partial video for event id %i to %s .....DONE', event_id, outfile_mp4)
+            return outfile_mp4
 
         else:
             download_response.raise_for_status()
@@ -297,8 +292,8 @@ class CameraMotionEventHandler:
                 chat_id = self.camera["tele_chat_id"]
                 tb.send_chat_action(chat_id, 'upload_video')
 
-                with open(gif, "rb") as fb: 
-                    retcode = tb.send_animation(chat_id, fb, disable_notification=True, caption=self.camera["name"])
+                with open(gif, "rb") as fb:
+                    tb.send_animation(chat_id, fb, disable_notification=True, caption=self.camera["name"])
 
                 # remove file on success
                 os.remove(gif)
@@ -335,7 +330,7 @@ class CameraMotionEventHandler:
                 tb.send_chat_action(chat_id, 'upload_video')
 
                 with open(video, "rb") as fb:
-                    retcode = tb.send_video(chat_id, fb, disable_notification=True, caption=caption)
+                    tb.send_video(chat_id, fb, disable_notification=True, caption=caption)
 
                 # remove file on success
                 os.remove(video)
@@ -360,13 +355,11 @@ class CameraMotionEventHandler:
 
 
     def poll_event(self):
-        #logging.info('Start getting last camera event for camera %s', self.camera["id"])
         camera_time = self.camera["skip_first_n_secs"] + self.camera["max_length_secs"]
         camera_id = self.camera["id"]
         event_id, event_ds_id = syno_last_event(self.base_url, camera_id, camera_time, self.camera["srcType"], self.camera["dsId"], self.sid)
         if event_id > -1:
-            if check_already_processed_event_by_camera(self.processed_events_conn, camera_id, event_id):
-                #logging.info('Event %s already processed', event_id)
+            if is_event_processed(self.processed_events_conn, camera_id, event_id):
                 return None, None
 
             logging.info('Start downloading event video for event_id %i, camera_id %i', event_id, camera_id)
@@ -381,9 +374,9 @@ class CameraMotionEventHandler:
             if delivery == "gif":
                 outfile = '{}/{}.gif'.format(outdir, event_id)
                 convert_retcode = convert_video_gif(scale,
-                                                         self.camera["skip_first_n_secs"],
-                                                         self.camera["max_length_secs"],
-                                                         mp4_file, outfile, fps=fps)
+                                                    self.camera["skip_first_n_secs"],
+                                                    self.camera["max_length_secs"],
+                                                    mp4_file, outfile, fps=fps)
             else:
                 outfile = '{}/{}_video.mp4'.format(outdir, event_id)
                 convert_retcode = convert_video_to_mp4(scale,
@@ -405,11 +398,36 @@ class CameraMotionEventHandler:
                     logging.error('Invalid return code from telegram send for event_id %i, camera_id %i', event_id, camera_id)
             else:
                 logging.error('Invalid return code from ffmpeg subprocess call for event id %i', event_id)
-        #else:
-            #logging.info('No event found for camera %s', self.camera["id"])
+
+
+def _configure_camera(config, camera_info):
+    for camera in config["synology_cameras"]:
+        if camera["id"] == camera_info["id"]:
+            camera["dsId"] = camera_info["ownerDsId"]
+            camera["name"] = camera_info["name"]
+            # delete active handler during re-auth
+            camera.pop("handler", None)
+
+            if int(camera["dsId"]) > 0:
+                camera["srcType"] = 2  # type 2 - recording server
+            else:
+                camera["srcType"] = 0  # type 0 - host server
+
+            if "tele_bot_token" in camera:
+                camera["bot"] = telebot.TeleBot(camera["tele_bot_token"])
+            elif "tele_bot_token" in config:
+                if not "bot" in config:
+                    config["bot"] = telebot.TeleBot(config["tele_bot_token"])
+                camera["bot"] = config["bot"]
+
+            if not "tele_chat_id" in camera and "tele_chat_id" in config:
+                camera["tele_chat_id"] = config["tele_chat_id"]
+            break
 
 
 def main():
+    global logged_in
+
     _, config_filename = sys.argv
     logging.info('Starting')
     logging.info('Parsing %s', config_filename)
@@ -439,7 +457,6 @@ def main():
         logging.error('Error! cannot create the database connection.')
         return
 
-    logged_in = False
     try:
         while True:
             time.sleep(10)
@@ -453,40 +470,17 @@ def main():
                     logging.info('Synology Auth ok')
                     info_data = syno_info(config["synology_base_api_url"], sid)
                     for camera_info in info_data["data"]["cameras"]:
-                        logging.warning('Synology Info Camera Id %s Name %s IP %s DsID %s', camera_info["id"], camera_info["name"],
-                                     camera_info["host"], camera_info["ownerDsId"])
-
-                        # TODO: that's a bit messy additional setup, needs to be improved later
-                        for camera in config["synology_cameras"]:
-                            if camera["id"] == camera_info["id"]:
-                                camera["dsId"] = camera_info["ownerDsId"]
-                                camera["name"] = camera_info["name"]
-                                # delete active handler during re-auth
-                                camera.pop("handler", None)
-
-                                if int(camera["dsId"]) > 0:
-                                    camera["srcType"] = 2  # type 2 - recording server
-                                else:
-                                    camera["srcType"] = 0  # type 0 - host server
-
-                                if "tele_bot_token" in camera:
-                                    camera["bot"] = telebot.TeleBot(camera["tele_bot_token"])
-                                elif "tele_bot_token" in config:
-                                    if not "bot" in config:
-                                        config["bot"] = telebot.TeleBot(config["tele_bot_token"])
-                                    camera["bot"] = config["bot"]
-
-                                if not "tele_chat_id" in camera and "tele_chat_id" in config:
-                                    camera["tele_chat_id"] = config["tele_chat_id"]
-                                break
+                        logging.warning('Synology Info Camera Id %i Name %s IP %s DsID %s',
+                                        camera_info["id"], camera_info["name"],
+                                        camera_info["host"], camera_info["ownerDsId"])
+                        _configure_camera(config, camera_info)
 
             for camera in config["synology_cameras"]:
-                #logging.info('CameraMotionEventHandler poll_event %s', camera["id"])
                 if not "handler" in camera:
                     logging.info('CameraMotionEventHandler created poll_event %s', camera["id"])
                     camera["handler"] = CameraMotionEventHandler(processed_events_conn, config["synology_base_api_url"],
-                                                          camera,
-                                                          config, sid)
+                                                                 camera,
+                                                                 config, sid)
                 camera["handler"].poll_event()
 
     except KeyboardInterrupt:
