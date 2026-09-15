@@ -11,6 +11,7 @@ import urllib.parse
 import telebot
 from pathlib import Path
 from sqlite3 import Error
+from telebot import apihelper
 from telebot.apihelper import ApiTelegramException
 
 import requests
@@ -34,6 +35,11 @@ synoApiEventDownloadUrl = "{}/webapi/entry.cgi?api=SYNO.SurveillanceStation.Reco
                           "&method=Download&version=6&id={}&_sid={}"
 synoApiCMSEventDownloadUrl = "{}/webapi/entry.cgi?api=SYNO.SurveillanceStation.CMS&method=Redirect&version=1&dsId={}&webAPI={}&isDownloadFile=true&_sid={}"
 synoApiCMSRedirectArgs = "{{\"api\":\"SYNO.SurveillanceStation.Recording\",\"version\":6,\"method\":\"Download\",\"id\":{}}}"
+synoApiEventDownloadUrlPartial = "{}/webapi/entry.cgi?api=SYNO.SurveillanceStation.Recording" \
+                                 "&method=Download&version=6&id={}&offsetTimeMs={}&playTimeMs={}&_sid={}"
+
+# extra playback seconds appended after skip_first_n_secs + max_length_secs when downloading a slice
+DOWNLOAD_MARGIN_SECS = 4
 
 sql_create_processed_events_table = """ CREATE TABLE IF NOT EXISTS processed_events (
                                         id integer PRIMARY KEY,
@@ -189,17 +195,85 @@ def syno_download_video(download_dir, base_url, event_id, event_ds_id, sid):
             download_response.raise_for_status()
 
 
-def convert_video_gif(scale, skip_first_n_secs, max_length_secs, input_video, output_gif):
-    logging.info('convert_video_gif scale %i skip_first_n_secs %i max_length_secs %i input_video %s output_gif %s',
-                 scale, skip_first_n_secs, max_length_secs, input_video, output_gif)
+def syno_download_video_partial(download_dir, base_url, event_id, event_ds_id, sid, play_time_ms, offset_time_ms=0):
+    outfile_gif = '{}/{}.mp4'.format(download_dir, event_id)
+
+    with open(outfile_gif, "wb") as f:
+        logging.info('Downloading partial video for event id %i (offset %ims, play %ims) to %s .....',
+                     event_id, offset_time_ms, play_time_ms, outfile_gif)
+
+        if event_ds_id > 0:
+            redirect_args = json.dumps({
+                "api": "SYNO.SurveillanceStation.Recording",
+                "version": 6,
+                "method": "Download",
+                "id": event_id,
+                "offsetTimeMs": offset_time_ms,
+                "playTimeMs": play_time_ms
+            }, separators=(',', ':'))
+            uri = synoApiCMSEventDownloadUrl.format(base_url, event_ds_id, redirect_args, sid)
+        else:
+            uri = synoApiEventDownloadUrlPartial.format(base_url, event_id, offset_time_ms, play_time_ms, sid)
+
+        download_response = requests.get(uri, verify=False, stream=True)
+        #logging.info('download_response status_code %s', download_response.status_code)
+
+        if download_response.ok:
+            total_length = download_response.headers.get('content-length')
+
+            if total_length is None:  # no content length header
+                f.write(download_response.content)
+            else:
+                dl = 0
+                total_length = int(total_length)
+                for data in download_response.iter_content(chunk_size=4096):
+                    dl += len(data)
+                    f.write(data)
+                    done = int(50 * dl / total_length)
+                    sys.stdout.flush()
+            logging.info('Downloading partial video for event id %i to %s .....DONE', event_id, outfile_gif)
+            return outfile_gif
+
+        else:
+            download_response.raise_for_status()
+
+
+def convert_video_gif(scale, skip_first_n_secs, max_length_secs, input_video, output_gif, fps=15):
+    logging.info('convert_video_gif scale %i skip_first_n_secs %i max_length_secs %i fps %i input_video %s output_gif %s',
+                 scale, skip_first_n_secs, max_length_secs, fps, input_video, output_gif)
+
+    seek_to = datetime.timedelta(seconds=skip_first_n_secs)
 
     retcode = subprocess.call([
-        "ffmpeg", "-stats", "-i", input_video, "-vf",
-        "fps=15,scale={}:-1:flags=lanczos".format(scale),
-        "-ss", "00:00:" + "{}".format(skip_first_n_secs).zfill(2), "-t", "{}".format(max_length_secs), "-y",
+        "ffmpeg", "-loglevel", "warning", "-y",
+        # input option -ss: keyframe fast seek (frame-accurate, may clip one frame at the start)
+        "-ss", str(seek_to),
+        "-i", input_video,
+        "-vf", "fps={},scale={}:-1:flags=bilinear".format(fps, scale),
+        "-vsync", "vfr",
+        "-t", "{}".format(max_length_secs),
         str(output_gif)
     ])
-    os.remove(input_video)
+    return retcode
+
+
+def convert_video_to_mp4(scale, skip_first_n_secs, max_length_secs, input_video, output_video, fps=15):
+    logging.info('convert_video_to_mp4 scale %i skip_first_n_secs %i max_length_secs %i fps %i input_video %s output_video %s',
+                 scale, skip_first_n_secs, max_length_secs, fps, input_video, output_video)
+
+    seek_to = datetime.timedelta(seconds=skip_first_n_secs)
+
+    retcode = subprocess.call([
+        "ffmpeg", "-loglevel", "warning", "-y",
+        "-ss", str(seek_to),
+        "-i", input_video,
+        "-vf", "fps={},scale={}:-2:flags=bilinear".format(fps, scale),
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "30",
+        "-pix_fmt", "yuv420p", "-an",
+        "-movflags", "+faststart",
+        "-t", "{}".format(max_length_secs),
+        str(output_video)
+    ])
     return retcode
 
 
@@ -248,6 +322,43 @@ class CameraMotionEventHandler:
         return False
 
 
+    def publish_video_telegram_message(self, video, caption):
+        max_attempts = 3  # maximum number of retries
+        for attempt in range(1, max_attempts + 1):
+            try:
+                if not "bot" in self.camera:
+                    logging.error("Camera %s does not have bot configured", self.camera["id"])
+                    return True
+
+                tb = self.camera["bot"]
+                chat_id = self.camera["tele_chat_id"]
+                tb.send_chat_action(chat_id, 'upload_video')
+
+                with open(video, "rb") as fb:
+                    retcode = tb.send_video(chat_id, fb, disable_notification=True, caption=caption)
+
+                # remove file on success
+                os.remove(video)
+                return True
+
+            except ApiTelegramException as e:
+                if e.error_code == 429:  # "Too Many Requests"
+                    retry_after = e.result_json['parameters']['retry_after']
+                    logging.warning("Telegram rate limit hit (attempt %d/%d). Retrying in %s seconds...",
+                                   attempt, max_attempts, retry_after)
+                    time.sleep(retry_after)
+                else:
+                    logging.error("Telegram API exception: %s", e)
+                    return False
+
+            except Exception as e:
+                logging.error("General exception: %s", e)
+                return False
+
+        logging.error("Failed to send after %d attempts", max_attempts)
+        return False
+
+
     def poll_event(self):
         #logging.info('Start getting last camera event for camera %s', self.camera["id"])
         camera_time = self.camera["skip_first_n_secs"] + self.camera["max_length_secs"]
@@ -259,14 +370,33 @@ class CameraMotionEventHandler:
                 return None, None
 
             logging.info('Start downloading event video for event_id %i, camera_id %i', event_id, camera_id)
-            mp4_file = syno_download_video(self.config["ffmpeg_working_folder"], self.base_url, event_id, event_ds_id, self.sid)
-            outfile_gif = '{}/{}.gif'.format(self.config["ffmpeg_working_folder"], event_id)
-            convert_retcode = convert_video_gif(self.camera["scale"],
-                                                self.camera["skip_first_n_secs"],
-                                                self.camera["max_length_secs"],
-                                                mp4_file, outfile_gif)
+            play_time_ms = (camera_time + DOWNLOAD_MARGIN_SECS) * 1000
+            mp4_file = syno_download_video_partial(self.config["ffmpeg_working_folder"], self.base_url, event_id, event_ds_id, self.sid, play_time_ms)
+
+            outdir = self.config["ffmpeg_working_folder"]
+            delivery = self.config.get("format", "mp4").lower()
+            fps = self.camera.get("fps", 15)
+            scale = self.camera["scale"]
+
+            if delivery == "gif":
+                outfile = '{}/{}.gif'.format(outdir, event_id)
+                convert_retcode = convert_video_gif(scale,
+                                                         self.camera["skip_first_n_secs"],
+                                                         self.camera["max_length_secs"],
+                                                         mp4_file, outfile, fps=fps)
+            else:
+                outfile = '{}/{}_video.mp4'.format(outdir, event_id)
+                convert_retcode = convert_video_to_mp4(scale,
+                                                       self.camera["skip_first_n_secs"],
+                                                       self.camera["max_length_secs"],
+                                                       mp4_file, outfile, fps=fps)
+            if os.path.exists(mp4_file):
+                os.remove(mp4_file)
             if convert_retcode == 0:
-                tele_retcode = self.publish_telegram_message(outfile_gif)
+                if delivery == "gif":
+                    tele_retcode = self.publish_telegram_message(outfile)
+                else:
+                    tele_retcode = self.publish_video_telegram_message(outfile, self.camera["name"])
                 if tele_retcode:
                     processed_event = (camera_id, event_id, datetime.datetime.now());
                     replace_processed_events(self.processed_events_conn, processed_event)
@@ -284,6 +414,15 @@ def main():
     logging.info('Starting')
     logging.info('Parsing %s', config_filename)
     config = parse_config(config_filename)
+
+    if "proxy" in config and config["proxy"]:
+        proxy_string = config["proxy"]
+        apihelper.proxy = {'https': proxy_string}
+        logging.info("Proxy set: %s", proxy_string)
+
+    if "tele_base_url" in config and config["tele_base_url"]:
+        apihelper.API_URL = config["tele_base_url"] + "/bot{0}/{1}"
+        logging.info("Telegram base URL set: %s", config["tele_base_url"])
 
     config_data_folder = ''
     if 'data_folder' in config:
