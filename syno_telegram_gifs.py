@@ -45,6 +45,27 @@ SYNO_AUTH_ERROR_CODES = {105, 106, 107, 119}
 DOWNLOAD_CHUNK_SIZE = 4096
 DOWNLOAD_PROGRESS_SCALE = 50
 
+# output video height in lines (e.g. 480 = 480p); width is derived from aspect ratio
+DEFAULT_VIDEO_MAX_HEIGHT = 480
+# x264 encoding preset for mp4 delivery
+DEFAULT_VIDEO_PRESET = "veryfast"
+X264_PRESETS = {"ultrafast", "superfast", "veryfast", "faster", "fast",
+                "medium", "slow", "slower", "veryslow", "placebo"}
+
+
+def normalize_video_height(video_max_height):
+    try:
+        height = int(video_max_height)
+    except (TypeError, ValueError):
+        logging.warning('Invalid video_max_height %r, using default %i',
+                        video_max_height, DEFAULT_VIDEO_MAX_HEIGHT)
+        height = DEFAULT_VIDEO_MAX_HEIGHT
+    if height <= 0:
+        logging.warning('Invalid video_max_height %r, using default %i',
+                        video_max_height, DEFAULT_VIDEO_MAX_HEIGHT)
+        height = DEFAULT_VIDEO_MAX_HEIGHT
+    return max(2, height // 2 * 2)  # yuv420p needs even dimensions
+
 sql_create_processed_events_table = """ CREATE TABLE IF NOT EXISTS processed_events (
                                         id integer PRIMARY KEY,
                                         camera_id text NOT NULL,
@@ -233,9 +254,10 @@ def syno_download_video_partial(download_dir, base_url, event_id, event_ds_id, s
             download_response.raise_for_status()
 
 
-def convert_video_gif(scale, skip_first_n_secs, max_length_secs, input_video, output_gif, fps=15):
-    logging.info('convert_video_gif scale %i skip_first_n_secs %i max_length_secs %i fps %i input_video %s output_gif %s',
-                 scale, skip_first_n_secs, max_length_secs, fps, input_video, output_gif)
+def convert_video_gif(video_max_height, skip_first_n_secs, max_length_secs, input_video, output_gif, fps=15):
+    height = normalize_video_height(video_max_height)
+    logging.info('convert_video_gif video_max_height %i skip_first_n_secs %i max_length_secs %i fps %i input_video %s output_gif %s',
+                 height, skip_first_n_secs, max_length_secs, fps, input_video, output_gif)
 
     seek_to = datetime.timedelta(seconds=skip_first_n_secs)
 
@@ -244,7 +266,7 @@ def convert_video_gif(scale, skip_first_n_secs, max_length_secs, input_video, ou
         # input option -ss: keyframe fast seek (frame-accurate, may clip one frame at the start)
         "-ss", str(seek_to),
         "-i", input_video,
-        "-vf", "fps={},scale={}:-1:flags=bilinear".format(fps, scale),
+        "-vf", "fps={},scale=-2:min(ih\\,{}):flags=bilinear".format(fps, height),
         "-vsync", "vfr",
         "-t", "{}".format(max_length_secs),
         str(output_gif)
@@ -252,9 +274,13 @@ def convert_video_gif(scale, skip_first_n_secs, max_length_secs, input_video, ou
     return retcode
 
 
-def convert_video_to_mp4(scale, skip_first_n_secs, max_length_secs, input_video, output_video, fps=15):
-    logging.info('convert_video_to_mp4 scale %i skip_first_n_secs %i max_length_secs %i fps %i input_video %s output_video %s',
-                 scale, skip_first_n_secs, max_length_secs, fps, input_video, output_video)
+def convert_video_to_mp4(video_max_height, skip_first_n_secs, max_length_secs, input_video, output_video, fps=15, preset=DEFAULT_VIDEO_PRESET):
+    height = normalize_video_height(video_max_height)
+    if preset not in X264_PRESETS:
+        logging.warning('Invalid video_preset %r, using default %s', preset, DEFAULT_VIDEO_PRESET)
+        preset = DEFAULT_VIDEO_PRESET
+    logging.info('convert_video_to_mp4 video_max_height %i skip_first_n_secs %i max_length_secs %i fps %i preset %s input_video %s output_video %s',
+                 height, skip_first_n_secs, max_length_secs, fps, preset, input_video, output_video)
 
     seek_to = datetime.timedelta(seconds=skip_first_n_secs)
 
@@ -262,8 +288,8 @@ def convert_video_to_mp4(scale, skip_first_n_secs, max_length_secs, input_video,
         "ffmpeg", "-loglevel", "warning", "-y",
         "-ss", str(seek_to),
         "-i", input_video,
-        "-vf", "fps={},scale={}:-2:flags=bilinear".format(fps, scale),
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "30",
+        "-vf", "fps={},scale=-2:min(ih\\,{}):flags=bilinear".format(fps, height),
+        "-c:v", "libx264", "-preset", preset, "-crf", "30",
         "-pix_fmt", "yuv420p", "-an",
         "-movflags", "+faststart",
         "-t", "{}".format(max_length_secs),
@@ -369,20 +395,21 @@ class CameraMotionEventHandler:
             outdir = self.config["ffmpeg_working_folder"]
             delivery = self.config.get("format", "mp4").lower()
             fps = self.camera.get("fps", 15)
-            scale = self.camera["scale"]
+            video_max_height = self.camera.get("video_max_height", DEFAULT_VIDEO_MAX_HEIGHT)
+            preset = self.config.get("video_preset", DEFAULT_VIDEO_PRESET)
 
             if delivery == "gif":
                 outfile = '{}/{}.gif'.format(outdir, event_id)
-                convert_retcode = convert_video_gif(scale,
+                convert_retcode = convert_video_gif(video_max_height,
                                                     self.camera["skip_first_n_secs"],
                                                     self.camera["max_length_secs"],
                                                     mp4_file, outfile, fps=fps)
             else:
                 outfile = '{}/{}_video.mp4'.format(outdir, event_id)
-                convert_retcode = convert_video_to_mp4(scale,
+                convert_retcode = convert_video_to_mp4(video_max_height,
                                                        self.camera["skip_first_n_secs"],
                                                        self.camera["max_length_secs"],
-                                                       mp4_file, outfile, fps=fps)
+                                                       mp4_file, outfile, fps=fps, preset=preset)
             if os.path.exists(mp4_file):
                 os.remove(mp4_file)
             if convert_retcode == 0:

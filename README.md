@@ -30,7 +30,7 @@ For example:
       "id": 1, 
       "skip_first_n_secs": 5, //<-- Skip seconds recorded before motion event is triggered
       "max_length_secs": 5, //<-- Do not create gif for video full length but only with first n seconds
-      "scale": 320, //<-- Determine quality and size of the output gif
+      "video_max_height": 480, //<-- Output video height in lines (e.g. 480 = 480p); smaller sources are never upscaled
       "tele_bot_token": "XXX", //<-- custom bot token for this camera
       "tele_chat_id": 123 //<-- custom chat id for this camera
     },
@@ -38,7 +38,7 @@ For example:
       "id": 2,
       "skip_first_n_secs": 7,
       "max_length_secs": 10,
-      "scale": 640,
+      "video_max_height": 480,
       "topic_name": "camera_2"
     }
   ]
@@ -48,6 +48,7 @@ For example:
 * `data_folder`: Path where to stored sqlite db for already processed events (preserve state across restarts). Leave empty if using docker image.
 * `tele_bot_token`: Telegram Bot token, this is a default global setting, can be skipped when using per-camera setting
 * `tele_chat_id`: Target chat id, this is a default global setting, can be skipped when using per-camera setting
+* `video_preset`: Global x264 encoding preset for mp4 delivery (default "veryfast")
 * `ffmpeg_working_folder`: Working folder for downloaded mp4 videos and created GIFs
 * `synology_base_api_url`: Base url of Synology Surveillance Station APIs
 * `synology_user`: User to access Synology Surveillance Station APIs
@@ -56,7 +57,7 @@ For example:
     * `id`: Synology Surveillance Station camera id
     * `skip_first_n_secs`: Skip seconds recorded before motion event is triggered
     * `max_length_secs`: Do not create gif for video full length but only with first n seconds
-    * `scale`: Determine quality and size of the output gif
+    * `video_max_height`: Output video height in lines (e.g. 480 = 480p); width follows aspect ratio, smaller sources are never upscaled
     * `tele_bot_token`: Per-camera Telegram settings
     * `tele_chat_id`: Per-camera Telgram settings
 
